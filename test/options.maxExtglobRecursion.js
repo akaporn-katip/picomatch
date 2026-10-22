@@ -118,6 +118,56 @@ describe('options.maxExtglobRecursion', () => {
     assert(isMatch('+(a|aa)x', '+(a|aa)@(x)'));
     assert(!isMatch('aaax', '+(a|aa)@(x)'));
   });
+  it('should literalize single-branch repeated extglobs with an unanchored star (CVE-2026-112366)', () => {
+    // A bare top-level `*` anchored only by a literal to its right keeps an
+    // ambiguous left boundary on every repeat iteration, so `+(*a)` compiled to
+    // `(?:[^/]*?a)+` and backtracked exponentially. These are now literalized.
+    assert.strictEqual(makeRe('+(*a)').source, '^(?:\\+\\(\\*a\\))$');
+    assert.strictEqual(makeRe('*(*a)').source, '^(?:\\*\\(\\*a\\))$');
+    assert.strictEqual(makeRe('+(*ab)').source, '^(?:\\+\\(\\*ab\\))$');
+    assert.strictEqual(makeRe('+(*[ab])').source, '^(?:\\+\\(\\*\\[ab\\]\\))$');
+    assert.strictEqual(makeRe('+(**a)').source, '^(?:\\+\\(\\*\\*a\\))$');
+
+    // The multi-branch heuristics only run when there is more than one branch;
+    // a single risky branch alongside a safe one must still be caught.
+    assert.strictEqual(makeRe('+(*a|b)').source, '^(?:\\+\\(\\*a\\|b\\))$');
+    assert.strictEqual(makeRe('+(*a|*b)').source, '^(?:\\+\\(\\*a\\|\\*b\\))$');
+
+    // A leading literal anchors each iteration and stays linear, so it is kept.
+    assert.strictEqual(makeRe('+(a*)').source, '^(?:(?=.)(?:a[^/]*?)+)$');
+    assert.strictEqual(makeRe('+(x*a)').source, '^(?:(?=.)(?:x[^/]*?a)+)$');
+  });
+
+  it('should collapse pure star repeated extglobs to a flat quantifier (CVE-2026-112366)', () => {
+    // `+(*)` is redundant repetition of `*`; collapsing it to a single flat
+    // quantifier removes the `(?:[^/]*?)+` backtracking while preserving matches.
+    assert.strictEqual(makeRe('+(*)').source, '^(?:(?=.)[^/]*)$');
+    assert.strictEqual(makeRe('*(*)').source, '^(?:(?=.)[^/]*)$');
+    assert.strictEqual(makeRe('+(*)c').source, '^(?:(?=.)[^/]*c)$');
+
+    assert(isMatch('abc', '+(*)c'));
+    assert(isMatch('c', '+(*)c'));
+    assert(!isMatch('ab/c', '+(*)c'));
+    assert(isMatch('abc', '+(*)'));
+    assert(!isMatch('', '+(*)'));
+  });
+
+  it('should not catastrophically backtrack on repeated extglobs (CVE-2026-112366)', () => {
+    const patterns = ['+(*)', '*(*)', '+(*a)', '*(*a)', '+(*ab)', '+(*.js)', '+(*a|*b)'];
+
+    for (const pattern of patterns) {
+      const re = makeRe(pattern);
+      const start = process.hrtime.bigint();
+      // Inputs engineered to force the match to fail: a mostly-uniform run that
+      // the vulnerable regexes would partition exponentially before giving up.
+      for (const input of ['a'.repeat(50) + '/', 'ab'.repeat(40) + '/', '.js'.repeat(30) + '/']) {
+        re.test(input);
+      }
+      const ms = Number(process.hrtime.bigint() - start) / 1e6;
+      assert(ms < 1000, `${pattern} took ${Math.round(ms)}ms (possible ReDoS)`);
+    }
+  });
+
   it('should disable the safeguard when maxExtglobRecursion is false', () => {
     assert(
       /\(\?:a\|aa\)\+/.test(
